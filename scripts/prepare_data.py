@@ -32,7 +32,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
-
+from tqdm import tqdm
 import yaml
 
 from scripts.utils_data import (
@@ -378,6 +378,58 @@ def convert_mxode_chinese_instruct(records: Sequence[Mapping[str, Any]]) -> List
         )
     return examples
 
+def convert_single_mxode_record(record: Mapping[str, Any], idx: int) -> Optional[Dict[str, Any]]:
+    """Helper: Convert a single record to the target format."""
+    # 1) 优先处理 messages 格式
+    if isinstance(record.get("messages"), list):
+        msgs = [m for m in record.get("messages", []) if isinstance(m, Mapping)]
+        norm_msgs = []
+        for m in msgs:
+            role = str(m.get("role") or m.get("from") or "").lower()
+            if role in {"human", "user"}:
+                role = "user"
+            elif role in {"assistant", "gpt", "bot"}:
+                role = "assistant"
+            content = normalize_text(str(m.get("content") or m.get("value") or ""))
+            if not content:
+                continue
+            norm_msgs.append({"role": role, "content": content})
+        if len(norm_msgs) >= 2:
+            joined = merge_messages(norm_msgs)
+            return {
+                "id": f"mxode-{idx}",
+                "source": "MXODE_CHINESE_INSTRUCT",
+                "messages": norm_msgs,
+                "hash": hash_for_text(joined),
+            }
+
+    # 2) 回退处理 instruction/input/output 格式
+    def pick_first(*keys: str) -> str:
+        for k in keys:
+            v = record.get(k)
+            if isinstance(v, str) and normalize_text(v):
+                return normalize_text(v)
+        return ""
+
+    instruction = pick_first("instruction", "query", "question", "prompt", "title", "task")
+    input_text = pick_first("input", "context")
+    output = pick_first("output", "response", "answer", "target", "completion", "text")
+
+    if not (instruction and output):
+        return None
+
+    user_turn = instruction if not input_text else f"{instruction}\n\n{input_text}"
+    joined = "\n".join([user_turn, output])
+    return {
+        "id": f"mxode-{idx}",
+        "source": "MXODE_CHINESE_INSTRUCT",
+        "messages": [
+            {"role": "user", "content": user_turn},
+            {"role": "assistant", "content": output},
+        ],
+        "hash": hash_for_text(joined),
+    }
+
 
 def normalize_preference(source_key: str, record: Mapping[str, Any]) -> Optional[Dict[str, str]]:
     """Normalize preference pair records into unified schema (robust mapping)."""
@@ -586,7 +638,6 @@ def build_sampler(config: Mapping[str, Any]) -> MixedBucketSampler:
 # Subset processing helpers (used by real pipeline)
 # ---------------------------------------------------------------------------
 
-
 def process_sft_subset(
     *,
     subset_name: str,
@@ -602,48 +653,96 @@ def process_sft_subset(
     seed: int,
     group_key: str,
 ) -> Tuple[List[Mapping[str, Any]], Dict[str, int]]:
-    """Process one Mxode/Chinese-Instruct subset and return normalized entries.
-
-    Returns a tuple of (entries, summary_counts). Each entry is a mapping ready
-    for sampling with fields like `messages`, `hash` and a `source` set to the
-    logical group (e.g., `mxode_stem`) so that group weights in the sampler
-    apply correctly. The original subset name is kept in `subset` for traceability.
-    """
-
-    # Map and filter
-    mapped = convert_mxode_chinese_instruct(dataset)
-    filtered = filter_by_language(mapped, min_cn_ratio, allow_english)
-    quality_checked = filter_by_quality(
-        filtered,
-        min_tokens=min_tokens,
-        max_tokens=max_tokens,
-        max_repetition=max_repetition,
+    """Memory-optimized processing: Shuffle -> Stream -> Early Stop (With Progress Bar)."""
+    
+    # 1. 计算安全采样上限
+    total_target = config["sft"]["max_samples"]
+    safe_limit = int(total_target * 1.5)
+    
+    LOGGER.info(
+        "Processing %s/%s: Target Limit ~%d samples", 
+        group_key, subset_name, safe_limit
     )
-    deduped = dedupe_by_hash(quality_checked, "hash")
 
-    # Attach source/group metadata
+    # 2. Shuffle (只打乱索引)
+    shuffled_dataset = dataset.shuffle(seed=seed)
+
     out: List[Mapping[str, Any]] = []
-    for e in deduped:
-        item = dict(e)
-        item["source"] = group_key  # ensure sampler weights match the group key
+    seen_hashes = set()
+    
+    cnt_raw = 0
+    cnt_lang = 0
+    cnt_quality = 0
+    cnt_dedup = 0
+
+    # 3. 进度条包装
+    # total=len(dataset) 让进度条知道总共有多少原始数据
+    # desc 初始化显示正在扫描的子集名
+    iterator = tqdm(
+        shuffled_dataset, 
+        total=len(dataset), 
+        desc=f"Scanning {subset_name}",
+        unit="docs"
+    )
+
+    # 4. 流式遍历
+    for idx, record in enumerate(iterator):
+        cnt_raw += 1
+        
+        # A. 转换
+        item = convert_single_mxode_record(record, idx)
+        if not item:
+            continue
+
+        # B. 语言过滤
+        text_for_check = extract_text(item)
+        ratio = estimate_chinese_ratio(text_for_check)
+        if ratio < min_cn_ratio and not allow_english:
+            continue
+        cnt_lang += 1
+
+        # C. 质量过滤
+        tokens = estimate_token_length(text_for_check)
+        if not (min_tokens <= tokens <= max_tokens):
+            continue
+        if compute_ngram_repetition(text_for_check, n=4) > max_repetition:
+            continue
+        cnt_quality += 1
+
+        # D. 去重
+        h = item["hash"]
+        if h in seen_hashes:
+            continue
+        seen_hashes.add(h)
+        cnt_dedup += 1
+
+        # E. 保存
+        item["source"] = group_key
         item["subset"] = subset_name
         out.append(item)
 
-    LOGGER.info(
-        "SFT %s/%s: raw=%d lang_filtered=%d quality=%d deduped=%d",
-        group_key,
-        subset_name,
-        len(mapped),
-        len(filtered),
-        len(quality_checked),
-        len(deduped),
-    )
+        # [新增] 实时更新进度条描述，显示已收集数量
+        # 每收集 10 条或扫描 1000 条更新一次，避免频繁刷新影响性能
+        if len(out) % 10 == 0 or cnt_raw % 1000 == 0:
+            iterator.set_description(
+                f"Scanning {subset_name} | Collected: {len(out)}/{safe_limit}"
+            )
+
+        # F. 早停
+        if len(out) >= safe_limit:
+            # 完成后强制更新一次显示，并打印日志
+            iterator.set_description(f"Done {subset_name} | Collected: {len(out)}")
+            LOGGER.info("Hit limit (%d) for %s, stopping early.", safe_limit, subset_name)
+            break
+
+    # 确保进度条正确关闭（虽然 for 循环结束会自动处理，但显式关闭是个好习惯）
+    iterator.close()
 
     summary = {
-        "raw": len(mapped),
-        "lang": len(filtered),
-        "quality": len(quality_checked),
-        "dedup": len(deduped),
+        "raw": cnt_raw,
+        "lang": cnt_lang,
+        "quality": cnt_quality,
+        "dedup": cnt_dedup,
     }
     return out, summary
 
@@ -793,7 +892,11 @@ def execute_pipeline(config: Mapping[str, Any]) -> None:
                 subset_names = MXODE_GROUPS[key]
                 LOGGER.info("Processing SFT group %s with %d subsets: %s", key, len(subset_names), ", ".join(subset_names))
 
-                max_workers = min(len(subset_names), (os.cpu_count() or 4))
+                if group_key == "mxode_general":
+                    max_workers = 1
+                else:
+                    max_workers = min(len(subset_names), (os.cpu_count() or 4))
+                    
                 total_raw = total_lang = total_quality = total_dedup = 0
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures: Dict[Any, str] = {}
@@ -870,7 +973,11 @@ def execute_pipeline(config: Mapping[str, Any]) -> None:
                         cache_dir=str(local_dir),
                         dl_conf=dl_conf,
                     )
-                    LOGGER.info("Download completed for %s", key)
+                    # LOGGER.info("检测到网络问题，强制使用本地 dpo_zh.json 文件")
+                    
+                    # # 直接读取根目录下的 dpo_zh.json
+                    # ds = load_dataset("json", data_files="dpo_zh.json", split="train")
+                    # LOGGER.info("Download completed for %s", key)
                 records = convert_mxode_chinese_instruct(ds)
                 filtered = filter_by_language(records, min_cn_ratio, allow_english)
                 quality_checked = filter_by_quality(
@@ -897,17 +1004,23 @@ def execute_pipeline(config: Mapping[str, Any]) -> None:
             # 其他未知键：提示用户
             LOGGER.warning("Unknown SFT source key '%s' in mix; skip.", key)
 
-        items = [to_sampling_item(entry, "SFT") for entry in sft_entries]
+        items = [
+            to_sampling_item(entry, "SFT") 
+            for entry in tqdm(sft_entries, desc="SFT Sampling Prep", unit="items")
+        ]
+        print(">> [SFT] 数据准备完毕，开始执行采样计划 (Plan)...", flush=True)
         plan = sampler.plan(
             total_samples=config["sft"]["max_samples"],
             available_items=items,
             source_weights=config["sft"].get("mix", {}),
         )
+        print(f">> [SFT] 采样完成，选中 {len(plan.selected)} 条，准备写入磁盘...", flush=True)
         LOGGER.info("SFT sampling stats: %s", plan.stats)
         train, val, test = split_three_way([item.payload for item in plan.selected], seed=seed)
         write_jsonl(proc_root / "sft_train.jsonl", train)
         write_jsonl(proc_root / "sft_val.jsonl", val)
         write_jsonl(proc_root / "sft_test.jsonl", test)
+        print(">> [SFT] 写入磁盘完成！", flush=True)
 
     if stage in ("all", "pref"):
         pref_entries: List[Mapping[str, Any]] = []
@@ -923,15 +1036,15 @@ def execute_pipeline(config: Mapping[str, Any]) -> None:
             cfg_name = pref_cfg_map.get(key) if isinstance(pref_cfg_map, Mapping) else None
             cfg_name = cfg_name or meta["config"]
             LOGGER.info("Downloading from Hugging Face for %s with config %s", key, cfg_name)
-            ds = hf_load_dataset(
-                meta["hf_path"],
-                name=cfg_name,
-                split=meta["split"],
-                cache_dir=str(data_root / key),
-                dl_conf=dl_conf,
-            )
+            LOGGER.info("强制读取本地 dpo_zh.json")
+            print(f">> [DPO] 正在加载本地文件 dpo_zh.json，大文件解析较慢，请耐心等待...", flush=True)
+            ds = load_dataset("json", data_files="dpo_zh.json", split="train")
+            print(f">> [DPO] 加载完成！", flush=True)
             LOGGER.info("Download completed for %s", key)
-            mapped = [normalize_preference(key, row) for row in ds]
+            mapped = [
+                normalize_preference(key, row) 
+                for row in tqdm(ds, desc=f"Norm {key}", unit="rows")
+            ]
             prepared = [item for item in mapped if item]
             filtered = filter_by_language(prepared, min_cn_ratio, allow_english)
             quality_checked = filter_by_quality(
@@ -964,6 +1077,8 @@ def execute_pipeline(config: Mapping[str, Any]) -> None:
         write_jsonl(proc_root / "pref_train.jsonl", train)
         write_jsonl(proc_root / "pref_val.jsonl", val)
         write_jsonl(proc_root / "pref_test.jsonl", test)
+
+
 
 
 # ---------------------------------------------------------------------------

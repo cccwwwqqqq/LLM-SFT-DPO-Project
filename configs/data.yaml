@@ -16,7 +16,7 @@ sft:
   # 训练数据量建议：单卡 4090/5090 初学项目可从 60k 起步
   max_samples: 40000
   mix:
-    mxode_stem: 0.5
+    mxode_stem: 1.0
     mxode_commonsense: 0.3
     mxode_general: 0.2
   curriculum:

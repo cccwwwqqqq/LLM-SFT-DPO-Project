@@ -1,13 +1,13 @@
 general:
   dry_run: true
   seed: 42
-  output_json: outputs/eval/results.json
-  output_csv: outputs/eval/results.csv
-  log_dir: outputs/eval/logs
+  output_json: outputs/eval_dpo/results.json
+  output_csv: outputs/eval_dpo/results.csv
+  log_dir: outputs/eval_dpo/logs
 
 model:
   base_model: Qwen/Qwen2.5-7B-Instruct
-  peft_adapter: outputs/sft
+  peft_adapter: outputs/align/times/20260206_214733
   trust_remote_code: true
 
 tasks:

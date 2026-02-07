@@ -2,7 +2,8 @@
 """Direct Preference Optimization (DPO) training script with dry-run planning."""
 
 from __future__ import annotations
-
+from trl import DPOConfig
+import datetime
 import argparse
 import json
 import logging
@@ -166,7 +167,6 @@ def dry_run_report(config: DpoConfig) -> None:
         source_weights=config.data.get("mix", {}),
     )
     LOGGER.info("采样器示例统? %s", plan.stats)
-    LOGGER.info("DPO β=%s , reference_free=%s", config.dpo.get("beta"), config.dpo.get("reference_free"))
 
 
 def setup_logging(log_dir: str, backend: str) -> None:
@@ -210,7 +210,7 @@ def train(config: DpoConfig) -> None:
     from datasets import Dataset  # type: ignore
     from peft import LoraConfig, get_peft_model  # type: ignore
     from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments  # type: ignore
-    from trl import DPOTrainer, PairwiseDataCollatorWithPadding  # type: ignore
+    from trl import DPOTrainer  # type: ignore
 
     setup_logging(config.general["log_dir"], config.general.get("log_backend", "none"))
     sampler = MixedBucketSampler(
@@ -224,7 +224,7 @@ def train(config: DpoConfig) -> None:
     for split_name, file_key in (("train", "train_file"), ("eval", "eval_file")):
         path = config.data.get(file_key)
         if path:
-            LOGGER.info("加载偏好数据?s", path)
+            LOGGER.info("加载偏好数据%s", path)
             datasets[split_name] = build_dataset(path, sampler, weights)
 
     tokenizer = AutoTokenizer.from_pretrained(config.model["base_model"], trust_remote_code=config.model.get("trust_remote_code", False))
@@ -246,7 +246,7 @@ def train(config: DpoConfig) -> None:
         )
         model = get_peft_model(model, lora_cfg)
 
-    training_args = TrainingArguments(
+    training_args = DPOConfig(
         output_dir=config.general["output_dir"],
         num_train_epochs=config.training["epochs"],
         per_device_train_batch_size=config.training["per_device_train_batch_size"],
@@ -259,7 +259,7 @@ def train(config: DpoConfig) -> None:
         max_grad_norm=config.training["max_grad_norm"],
         logging_dir=config.general["log_dir"],
         logging_steps=50,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=config.general["eval_steps"],
         save_steps=config.general["checkpointing_steps"],
         save_total_limit=config.general["save_total_limit"],
@@ -268,17 +268,13 @@ def train(config: DpoConfig) -> None:
         gradient_checkpointing=config.model.get("gradient_checkpointing", False),
     )
 
-    collator = PairwiseDataCollatorWithPadding(tokenizer=tokenizer)
 
     trainer = DPOTrainer(
         model=model,
         args=training_args,
-        beta=config.dpo.get("beta", 0.1),
         train_dataset=datasets.get("train"),
         eval_dataset=datasets.get("eval"),
-        tokenizer=tokenizer,
-        data_collator=collator,
-        reference_free=config.dpo.get("reference_free", False),
+        processing_class=tokenizer,
     )
 
     trainer.train()
@@ -290,6 +286,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
     config = apply_cli_overrides(load_config(args.config), args)
+
+    # === [开始修改] 动态生成时间戳路径 (与 SFT 保持一致) ===
+    if not config.general.get("dry_run", True):
+        # 获取当前时间
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 获取原始配置的基础路径 (默认为 outputs/align)
+        base_output_dir = config.general["output_dir"]
+        
+        # 构造新路径: outputs/align/times/20260206_213000
+        new_output_dir = f"{base_output_dir}/times/{timestamp}"
+        
+        # 更新配置
+        config.general["output_dir"] = new_output_dir
+        # 更新日志路径，放在该时间戳目录下的 logs 文件夹中
+        config.general["log_dir"] = f"{new_output_dir}/logs"
+        
+        LOGGER.info(f"已将 DPO 输出路径重定向至: {new_output_dir}")
+    # === [结束修改] ===
 
     Path(config.general["output_dir"]).mkdir(parents=True, exist_ok=True)
     if config.general.get("dry_run", True):

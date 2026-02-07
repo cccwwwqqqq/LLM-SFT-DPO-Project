@@ -2,7 +2,7 @@
 """Supervised fine-tuning (SFT) with LoRA/QLoRA and dry-run planning."""
 
 from __future__ import annotations
-
+import datetime
 import argparse
 import json
 import logging
@@ -114,7 +114,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "data": {
         "train_file": "data_proc/sft_train.jsonl",
         "eval_file": "data_proc/sft_val.jsonl",
-        "dataset_text_field": "messages",
         "streaming": False,
     },
     "metrics": {
@@ -335,10 +334,8 @@ def train(config: SFTConfig) -> None:
         model = get_peft_model(model, lora_cfg)
         model.print_trainable_parameters()
 
-    dataset_text_field = config.data.get("dataset_text_field")
     formatting_func = None
-    if not dataset_text_field:
-        formatting_func = build_formatting_function(tokenizer)
+    formatting_func = build_formatting_function(tokenizer)
 
     report_to = config.general.get("log_backend")
     if report_to in {None, "none"}:
@@ -370,25 +367,43 @@ def train(config: SFTConfig) -> None:
 
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         args=training_args,
         train_dataset=datasets.get("train"),
         eval_dataset=datasets.get("validation"),
-        dataset_text_field=dataset_text_field,
         formatting_func=formatting_func,
-        packing=config.model.get("packing", False),
     )
     trainer.add_callback(MetricsCallback())
 
     trainer.train()
     trainer.save_model(config.general["output_dir"])
-    trainer.tokenizer.save_pretrained(config.general["output_dir"])
+    trainer.processing_class.save_pretrained(config.general["output_dir"])
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
     config = apply_cli_overrides(load_config(args.config), args)
+
+    # === [开始修改] 动态生成时间戳路径 ===
+    # 只有在非 dry-run 模式下才修改路径，避免 dry-run 产生空文件夹（可选）
+    if not config.general.get("dry_run", True):
+        # 获取当前时间，格式如: 20260206_213000
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 获取原始配置的基础路径 (默认为 outputs/sft)
+        base_output_dir = config.general["output_dir"]
+        
+        # 构造新路径: outputs/sft/times/20260206_213000
+        new_output_dir = f"{base_output_dir}/times/{timestamp}"
+        
+        # 更新配置
+        config.general["output_dir"] = new_output_dir
+        # 建议同时把日志也放到这个新目录下，方便对应查找
+        config.general["log_dir"] = f"{new_output_dir}/logs"
+        
+        LOGGER.info(f"已将输出路径重定向至: {new_output_dir}")
+    # === [结束修改] ===
 
     Path(config.general["output_dir"]).mkdir(parents=True, exist_ok=True)
     if config.general.get("dry_run", True):

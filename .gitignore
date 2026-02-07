@@ -20,3 +20,4 @@ checkpoints/
 *.log
 *.tmp
 
+dpo_zh.json

@@ -149,7 +149,7 @@ def run_evaluation(config: Mapping[str, Any]) -> None:
 
     output_json = Path(config["general"]["output_json"])
     output_json.parent.mkdir(parents=True, exist_ok=True)
-    output_json.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+    output_json.write_text(json.dumps(results, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
     if config["metrics"].get("summarize", True):
         flat_rows = []

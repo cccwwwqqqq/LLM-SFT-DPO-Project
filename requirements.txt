@@ -16,7 +16,7 @@ peft>=0.11.1
 
 # 量化（可选）：如需 4/8bit 再单独安装适配 CUDA 的 bitsandbytes 版本
 # 留空，避免在不需要量化时引入不兼容的 CUDA 依赖
-
+matplotlib>=3.9.0
 # 其他
 numpy==2.1.2
 scipy>=1.14.1

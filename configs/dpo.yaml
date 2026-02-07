@@ -1,9 +1,9 @@
 general:
-  dry_run: true
+  dry_run: false
   seed: 42
   output_dir: outputs/align
   log_dir: outputs/align/logs_dpo
-  log_backend: none
+  log_backend: tensorboard
   checkpointing_steps: 500
   eval_steps: 500
   save_total_limit: 3
@@ -31,8 +31,8 @@ lora:
 
 training:
   epochs: 1.0
-  per_device_train_batch_size: 2
-  gradient_accumulation_steps: 16
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 32
   per_device_eval_batch_size: 2
   learning_rate: 6.0e-5
   lr_scheduler_type: cosine
@@ -41,6 +41,7 @@ training:
   max_grad_norm: 1.0
   bf16: true
   tf32: true
+  report_to: "tensorboard"
 
 dpo:
   beta: 0.2
