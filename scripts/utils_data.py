@@ -645,12 +645,41 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
-
+import os
+from pathlib import Path
 
 CONTROL_CHAR_PATTERN = re.compile(r"[\u0000-\u001f\u007f]")
 WHITESPACE_PATTERN = re.compile(r"\s+")
-HAN_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+HAN_PATTERN = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\u20000-\u2a6df]")
 ALPHA_PATTERN = re.compile(r'[a-zA-Z]')
+
+
+def get_latest_adapter(base_dir: str) -> str:
+    """
+    自动寻找 base_dir 下 times 子目录中时间戳最新的文件夹。
+    如果找不到 times 目录，则回退到 base_dir 本身。
+    """
+    base_path = Path(base_dir)
+    times_path = base_path / "times"
+    
+    # 1. 如果 times 目录不存在，说明可能还没开始用时间戳结构，直接返回原路径
+    if not times_path.exists():
+        print(f"[提示] 未找到 {times_path}，使用默认路径: {base_dir}")
+        return base_dir
+    
+    # 2. 获取所有子目录
+    subdirs = [d for d in times_path.iterdir() if d.is_dir()]
+    
+    # 3. 如果没有子目录，回退
+    if not subdirs:
+        return base_dir
+        
+    # 4. 按目录名排序（因为你的格式是 YYYYMMDD_HHMMSS，字符串排序等同于时间排序）
+    # reverse=True 取第一个即为最新
+    latest_dir = sorted(subdirs, key=lambda x: x.name, reverse=True)[0]
+    
+    print(f"[自动定位] 找到最新 Adapter: {latest_dir}")
+    return str(latest_dir)
 
 
 def normalize_text(text: str) -> str:
@@ -700,17 +729,30 @@ def dedupe_by_hash(records: Iterable[Mapping[str, object]], key: str) -> List[Ma
     return result
 
 
-def compute_ngram_repetition(text: str, n: int = 4) -> float:
+# 修改 scripts/utils_data.py 中的函数
+def compute_ngram_repetition(text: str, n: int = 4, token_level: str = "char") -> float:
+    """计算 n-gram 重复率。
+    token_level="char": 按字符切分（适用于中文，识别连续4字重复）。
+    token_level="word": 按空格切分（适用于英文，识别连续4词重复）。
+    """
     if not text:
         return 0.0
     if len(text) > 20000:
         text = text[:20000]
-    tokens = list(text)
+    
+    # 根据 token_level 选择切分方式
+    if token_level == "word":
+        tokens = text.split()  # 英文按空格切分单词
+    else:
+        tokens = list(text)    # 中文直接按字符切分
+        
     if len(tokens) < n:
         return 0.0
+    
     ngrams_count = len(tokens) - n + 1
     if ngrams_count <= 0:
         return 0.0
+    
     unique = set(tuple(tokens[i : i + n]) for i in range(ngrams_count))
     return 1.0 - len(unique) / ngrams_count
 

@@ -9,7 +9,8 @@ general:
   save_total_limit: 3
 
 model:
-  base_model: outputs/sft
+  base_model: /root/autodl-tmp/hf_cache/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
+  sft_adapter: outputs/sft
   trust_remote_code: true
   gradient_checkpointing: true
   max_seq_length: 4096
@@ -48,6 +49,7 @@ dpo:
   reference_free: false
   length_penalty: 0.02
   prefer_chinese_ratio: 0.7
+  cn_threshold: 0.6
 
 data:
   train_file: data_proc/pref_train.jsonl

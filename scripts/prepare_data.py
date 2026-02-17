@@ -30,6 +30,7 @@ import os
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 from tqdm import tqdm
@@ -522,6 +523,7 @@ def filter_by_language(entries: Iterable[Mapping[str, Any]], min_cn_ratio: float
     return filtered
 
 
+# 修改 scripts/prepare_data.py 中的 filter_by_quality 函数
 def filter_by_quality(
     entries: Iterable[Mapping[str, Any]],
     *,
@@ -535,9 +537,25 @@ def filter_by_quality(
         tokens = estimate_token_length(text)
         if tokens < min_tokens or tokens > max_tokens:
             continue
-        repetition = compute_ngram_repetition(text, n=4)
-        if repetition > max_repetition:
+            
+        # 1. 估算中文占比
+        ratio = estimate_chinese_ratio(text)
+        
+        # 2. 区分中英文处理逻辑
+        # 如果中文占比低于 0.3，视为英文/外语池数据
+        if ratio < 0.3:
+            # 英文：按单词切分，阈值放宽至 0.8
+            repetition = compute_ngram_repetition(text, n=4, token_level="word")
+            current_threshold = 0.8
+        else:
+            # 中文/混合：按字符切分，使用配置中的阈值（默认 0.6）
+            repetition = compute_ngram_repetition(text, n=4, token_level="char")
+            current_threshold = max_repetition
+            
+        if repetition > current_threshold:
+            # 日志记录（可选）：LOGGER.debug(f"Filtered due to {repetition} > {current_threshold}")
             continue
+            
         results.append(entry)
     return results
 
@@ -792,6 +810,30 @@ def dry_run_summary(config: Mapping[str, Any]) -> None:
     ensure_data_card(Path(config["general"]["proc_root"]))
 
 
+def _process_pref_chunk_static(ds, indices, key, min_tokens, max_tokens, max_repetition):
+    """
+    静态处理函数，用于多进程调用。
+    必须接收所有依赖变量作为参数。
+    """
+    # 这里的 ds 是 HuggingFace Dataset 对象，支持切片
+    sub_ds = ds.select(indices)
+    results = []
+    for row in sub_ds:
+        # 调用全局可见的 normalize_preference
+        mapped = normalize_preference(key, row)
+        if not mapped: continue
+        
+        # 调用全局可见的 filter_by_quality
+        valid = filter_by_quality(
+            [mapped], 
+            min_tokens=min_tokens, 
+            max_tokens=max_tokens, 
+            max_repetition=max_repetition
+        )
+        if valid:
+            results.append(valid[0])
+    return results
+
 def execute_pipeline(config: Mapping[str, Any]) -> None:
     def hf_load_dataset(dataset_path: str, *, name: Optional[str], split: str, cache_dir: str, dl_conf: Optional["DownloadConfig"], retries: int = 5) -> Dataset:
         last_exc: Optional[Exception] = None
@@ -1032,40 +1074,66 @@ def execute_pipeline(config: Mapping[str, Any]) -> None:
                 continue
             LOGGER.info("Loading preference source %s", key)
             # Resolve dataset config name (e.g., 'en'/'zh') from CLI or default spec
-            pref_cfg_map: Mapping[str, str] = config.get("preference", {}).get("configs", {})  # type: ignore[assignment]
-            cfg_name = pref_cfg_map.get(key) if isinstance(pref_cfg_map, Mapping) else None
-            cfg_name = cfg_name or meta["config"]
-            LOGGER.info("Downloading from Hugging Face for %s with config %s", key, cfg_name)
-            LOGGER.info("强制读取本地 dpo_zh.json")
-            print(f">> [DPO] 正在加载本地文件 dpo_zh.json，大文件解析较慢，请耐心等待...", flush=True)
-            ds = load_dataset("json", data_files="dpo_zh.json", split="train")
-            print(f">> [DPO] 加载完成！", flush=True)
-            LOGGER.info("Download completed for %s", key)
-            mapped = [
-                normalize_preference(key, row) 
-                for row in tqdm(ds, desc=f"Norm {key}", unit="rows")
-            ]
-            prepared = [item for item in mapped if item]
-            filtered = filter_by_language(prepared, min_cn_ratio, allow_english)
-            quality_checked = filter_by_quality(
-                filtered,
-                min_tokens=min_tokens,
-                max_tokens=max_tokens,
-                max_repetition=max_repetition,
-            )
-            deduped = dedupe_by_hash(quality_checked, "hash")
-            skipped = len(mapped) - len(prepared)
-            LOGGER.info(
-                "PREF %s: raw=%d mapped_ok=%d mapped_skipped=%d lang_filtered=%d quality=%d deduped=%d",
-                key,
-                len(mapped),
-                len(prepared),
-                skipped,
-                len(filtered),
-                len(quality_checked),
-                len(deduped),
-            )
+            configs_to_load = ["zh", "en"] if key == "dpo_en_zh_20k" else [meta["config"]]
+        
+            all_raw_data = []
+            for cfg in configs_to_load:
+                LOGGER.info(f"Downloading {key} with config: {cfg}...")
+                # 使用项目内置的带重试功能的 hf_load_dataset
+                ds_part = hf_load_dataset(
+                    meta["hf_path"],
+                    name=cfg,
+                    split=meta["split"],
+                    cache_dir=str(data_root / key),
+                    dl_conf=dl_conf,
+                )
+                all_raw_data.append(ds_part)
+                LOGGER.info(f"Config {cfg} loaded: {len(ds_part)} rows.")
+            
+            from datasets import concatenate_datasets
+            ds = concatenate_datasets(all_raw_data)
+            LOGGER.info(f"Total raw records from web: {len(ds)}")
+            
+            chunk_size = 2000
+            num_records = len(ds)
+            
+            # 获取配置参数（需要在循环外或此处获取）
+            min_tokens = config["general"]["min_tokens"]
+            max_tokens = config["general"]["max_tokens"]
+            max_repetition = config["general"]["max_repetition"]
+
+            max_workers = min(os.cpu_count() or 4, 8)
+            processed_results = []
+            
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # 生成索引切片
+                indices_list = [range(i, min(i + chunk_size, num_records)) 
+                            for i in range(0, num_records, chunk_size)]
+                
+                # 【修改点】调用全局函数 _process_pref_chunk_static，并显式传递所有参数
+                futures = [
+                    executor.submit(
+                        _process_pref_chunk_static, 
+                        ds,              # 传递数据集对象（HF Dataset 支持 Pickle）
+                        idxs,            # 当前切片索引
+                        key,             # 数据源 key
+                        min_tokens, 
+                        max_tokens, 
+                        max_repetition
+                    ) 
+                    for idxs in indices_list
+                ]
+                
+                for future in tqdm(as_completed(futures), total=len(futures), desc="Web DPO Processing"):
+                    try:
+                        processed_results.extend(future.result())
+                    except Exception as e:
+                        LOGGER.error(f"Chunk processing failed: {e}")
+            # 哈希去重
+            deduped = dedupe_by_hash(processed_results, "hash")
+            LOGGER.info(f"PREF {key} Final: raw={len(ds)} deduped={len(deduped)}")
             pref_entries.extend(deduped)
+            
         items = [to_sampling_item(entry, "PREF") for entry in pref_entries]
         plan = sampler.plan(
             total_samples=config["preference"]["max_samples"],

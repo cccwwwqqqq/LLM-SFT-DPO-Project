@@ -11,11 +11,11 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
-
+from peft import LoraConfig, get_peft_model, PeftModel
 import yaml
 
 from scripts.utils_data import LengthBucket, MixedBucketSampler, SamplingItem, estimate_chinese_ratio, estimate_token_length
-
+from scripts.utils_data import get_latest_adapter
 
 LOGGER = logging.getLogger(__name__)
 
@@ -185,24 +185,72 @@ def setup_logging(log_dir: str, backend: str) -> None:
             wandb.init(project="dpo-alignment", dir=log_dir)
 
 
+# def build_dataset(path: str, sampler: MixedBucketSampler, weights: Mapping[str, float]) -> Dataset:
+#     # Heavy imports moved inside to avoid OOM during dry-run
+#     from datasets import Dataset, load_dataset  # type: ignore
+#     raw = load_dataset("json", data_files=path, split="train", download_mode="force_redownload")
+#     items = [
+#         SamplingItem(
+#             identifier=row.get("source", "PREF") + row.get("prompt", "")[:12],
+#             source=row.get("source", "PREF"),
+#             text_length=estimate_token_length("\n".join([row.get("prompt", ""), row.get("chosen", ""), row.get("rejected", "")])),
+#             chinese_ratio=estimate_chinese_ratio("\n".join([row.get("prompt", ""), row.get("chosen", ""), row.get("rejected", "")])),
+#             payload=row,
+#         )
+#         for row in raw
+#     ]
+#     plan = sampler.plan(total_samples=len(items), available_items=items, source_weights=weights)
+#     LOGGER.info("采样后样本数: %d", len(plan.selected))
+#     return Dataset.from_list([item.payload for item in plan.selected])
 def build_dataset(path: str, sampler: MixedBucketSampler, weights: Mapping[str, float]) -> Dataset:
-    # Heavy imports moved inside to avoid OOM during dry-run
-    from datasets import Dataset, load_dataset  # type: ignore
-    raw = load_dataset("json", data_files=path, split="train")
-    items = [
-        SamplingItem(
-            identifier=row.get("source", "PREF") + row.get("prompt", "")[:12],
+    # 保持这里的 heavy imports
+    from datasets import Dataset, load_dataset
+    
+    # 1. 强制重载 (确保这一步你已经加上了)
+    LOGGER.info(f"正在加载数据文件: {path}")
+    raw = load_dataset("json", data_files=path, split="train", download_mode="force_redownload")
+
+    items = []
+    # === [诊断代码开始] ===
+    print(f"\n[DIAGNOSTIC] 开始逐条检查数据 (前 5 条)...")
+    for i, row in enumerate(raw):
+        # 1. 获取原始内容
+        p = row.get("prompt", "")
+        c = row.get("chosen", "")
+        r = row.get("rejected", "")
+        
+        # 2. 拼接文本 (与 check_ratio.py 保持一致)
+        full_text = "\n".join([p, c, r])
+        
+        # 3. 实时计算比例
+        # 注意：这里直接调用 utils_data 里的函数
+        ratio = estimate_chinese_ratio(full_text)
+        length = estimate_token_length(full_text)
+        
+        # 4. 打印前 5 条的详细信息
+        if i < 5:
+            print(f"--- Row {i} ---")
+            print(f"Content Preview: {full_text[:50].replace(chr(10), ' ')}...")
+            print(f"Prompt Length: {len(p)}, Chosen Length: {len(c)}")
+            print(f"Calculated Ratio: {ratio:.4f}")
+            print(f"Judged as: {'CN' if ratio >= 0.6 else 'EN'}")
+        
+        # 5. 构建对象
+        item = SamplingItem(
+            identifier=row.get("source", "PREF") + str(i),
             source=row.get("source", "PREF"),
-            text_length=estimate_token_length("\n".join([row.get("prompt", ""), row.get("chosen", ""), row.get("rejected", "")])),
-            chinese_ratio=estimate_chinese_ratio("\n".join([row.get("prompt", ""), row.get("chosen", ""), row.get("rejected", "")])),
+            text_length=length,
+            chinese_ratio=ratio,
             payload=row,
         )
-        for row in raw
-    ]
+        items.append(item)
+    print(f"[DIAGNOSTIC] 检查结束，共处理 {len(items)} 条数据。\n")
+    # === [诊断代码结束] ===
+
+    # 原有的采样逻辑
     plan = sampler.plan(total_samples=len(items), available_items=items, source_weights=weights)
     LOGGER.info("采样后样本数: %d", len(plan.selected))
     return Dataset.from_list([item.payload for item in plan.selected])
-
 
 def train(config: DpoConfig) -> None:
     # Import heavy libs lazily to keep dry-run lightweight
@@ -213,9 +261,12 @@ def train(config: DpoConfig) -> None:
     from trl import DPOTrainer  # type: ignore
 
     setup_logging(config.general["log_dir"], config.general.get("log_backend", "none"))
+    threshold = config.dpo.get("cn_threshold", 0.6)
+    LOGGER.info(f"当前中文判定阈值 (CN Threshold): {threshold}") # <--- 加上这行打印确认
     sampler = MixedBucketSampler(
         length_buckets=[LengthBucket(name="generic", min_tokens=0, max_tokens=config.model.get("max_seq_length", 2048))],
-        target_cn_ratio=config.dpo.get("prefer_chinese_ratio", 0.7),
+        target_cn_ratio=config.dpo.get("prefer_chinese_ratio", 0.6),
+        cn_threshold=threshold,
         seed=config.general.get("seed", 42),
     )
 
@@ -230,12 +281,30 @@ def train(config: DpoConfig) -> None:
     tokenizer = AutoTokenizer.from_pretrained(config.model["base_model"], trust_remote_code=config.model.get("trust_remote_code", False))
     tokenizer.padding_side = "right"
 
+    LOGGER.info(f"加载基座模型: {config.model['base_model']}")
     model = AutoModelForCausalLM.from_pretrained(
         config.model["base_model"],
         trust_remote_code=config.model.get("trust_remote_code", False),
         torch_dtype=torch.bfloat16 if config.training.get("bf16") else None,
     )
-
+    
+    sft_root = config.model.get("sft_adapter") # 从配置读取 SFT 根目录
+    
+    if sft_root:
+        # 1. 自动解析出最新的时间戳目录
+        latest_sft_path = get_latest_adapter(sft_root)
+        LOGGER.info(f"Auto-detected SFT Adapter: {latest_sft_path}")
+        
+        # 2. 加载 SFT Adapter
+        LOGGER.info("Merging SFT adapter into base model (In-Memory)...")
+        model = PeftModel.from_pretrained(model, latest_sft_path)
+        
+        # 3. 合并并卸载 (Merge & Unload)
+        # 这一步会将 LoRA 权重加到基座模型参数里，并释放 Adapter 结构
+        model = model.merge_and_unload()
+        LOGGER.info("Merge complete. Model is now ready for DPO.")
+    
+        
     if config.lora.get("enable"):
         lora_cfg = LoraConfig(
             r=config.lora.get("r", 16),

@@ -1,106 +1,69 @@
 #!/usr/bin/env python
-"""Export LoRA adapters or merged weights (dry-run by default)."""
-
-from __future__ import annotations
-
+"""
+Export and merge LoRA weights script.
+Usage:
+    python -m scripts.export_lora \
+        --model_name_or_path <base_model> \
+        --adapter_path <lora_path> \
+        --output_path <merged_path>
+"""
 import argparse
-import json
 import logging
-from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
-
-import yaml
+import os
+import torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 LOGGER = logging.getLogger(__name__)
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Export LoRA adapters or merged weights")
+    parser.add_argument("--model_name_or_path", type=str, required=True, help="基座模型路径或名称 (Base Model)")
+    parser.add_argument("--adapter_path", type=str, required=True, help="LoRA 权重目录 (SFT Checkpoint)")
+    parser.add_argument("--output_path", type=str, required=True, help="合并后模型的保存路径")
+    parser.add_argument("--export_format", type=str, default="saved_model", help="导出格式 (默认 saved_model)")
+    parser.add_argument("--device", type=str, default="auto", help="设备 (auto, cpu, cuda)")
+    return parser.parse_args()
 
-DEFAULT_CONFIG: Dict[str, Any] = {
-    "general": {
-        "dry_run": True,
-        "adapter_dir": "outputs/align",
-        "base_model": "Qwen/Qwen2.5-7B-Instruct",
-        "output_dir": "outputs/adapters",
-        "merge_weights": False,
-    }
-}
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args()
 
+    LOGGER.info(f"Loading base model from: {args.model_name_or_path}")
+    
+    # 加载基座模型
+    try:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            torch_dtype=torch.float16, # 建议使用 fp16 以节省显存
+            device_map=args.device,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+    except Exception as e:
+        LOGGER.error(f"Failed to load base model: {e}")
+        raise
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export LoRA adapters")
-    parser.add_argument("--config", type=str, default="configs/sft.yaml", help="可复用 SFT 配置文件")
-    parser.add_argument("--dry-run", type=str, default=None)
-    parser.add_argument("--log-level", type=str, default="INFO")
-    return parser.parse_args(argv)
+    LOGGER.info(f"Loading tokenizer from: {args.model_name_or_path}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name_or_path, 
+        trust_remote_code=True
+    )
 
+    LOGGER.info(f"Loading LoRA adapter from: {args.adapter_path}")
+    # 加载 LoRA
+    model = PeftModel.from_pretrained(base_model, args.adapter_path)
 
-def load_config(path: str) -> Dict[str, Any]:
-    config = json.loads(json.dumps(DEFAULT_CONFIG))
-    cfg_path = Path(path)
-    if cfg_path.exists():
-        with cfg_path.open("r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
-        # 允许从 SFT 配置读取路径
-        general = raw.get("general", {})
-        config["general"].update({
-            "adapter_dir": general.get("output_dir", config["general"]["adapter_dir"]),
-            "merge_weights": general.get("merge_weights", config["general"].get("merge_weights", False)),
-        })
-        if "model" in raw:
-            config["general"].update({"base_model": raw["model"].get("base_model", config["general"]["base_model"])})
-    return config
+    LOGGER.info("Merging weights (merge_and_unload)...")
+    # 核心步骤：合并权重
+    model = model.merge_and_unload()
 
+    LOGGER.info(f"Saving merged model to: {args.output_path}")
+    # 保存合并后的模型
+    model.save_pretrained(args.output_path)
+    tokenizer.save_pretrained(args.output_path)
+    
+    LOGGER.info("Export completed successfully!")
 
-def apply_cli_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
-    if args.dry_run is not None:
-        config["general"]["dry_run"] = str(args.dry_run).lower() not in {"false", "0", "no"}
-    return config
-
-
-def dry_run_summary(config: Mapping[str, Any]) -> None:
-    LOGGER.info("Dry-run 模式：不会导出权重")
-    LOGGER.info("Adapter 目录：%s", config["general"].get("adapter_dir"))
-    LOGGER.info("输出目录：%s", config["general"].get("output_dir"))
-    # 粗略估算（以 r=16, hidden=4096, layers=32 计算）
-    estimated_mb = (2 * 16 * 4096 * 32 * 2) / (1024 ** 2)
-    LOGGER.info("预估导出大小：约 %.1f MB（需远程验证）", estimated_mb)
-
-
-def export_lora(config: Mapping[str, Any]) -> None:
-    try:  # pragma: no cover
-        import torch
-        from peft import PeftModel
-        from transformers import AutoModelForCausalLM
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("需要在远程环境安装 transformers/peft") from exc
-
-    adapter_dir = Path(config["general"]["adapter_dir"])
-    output_dir = Path(config["general"]["output_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    model = AutoModelForCausalLM.from_pretrained(config["general"]["base_model"], trust_remote_code=True)
-    peft_model = PeftModel.from_pretrained(model, adapter_dir)
-
-    if config["general"].get("merge_weights", False):
-        merged = peft_model.merge_and_unload()
-        merged.save_pretrained(output_dir)
-    else:
-        peft_model.save_pretrained(output_dir)
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
-    config = load_config(args.config)
-    config = apply_cli_overrides(config, args)
-
-    if config["general"].get("dry_run", True):
-        dry_run_summary(config)
-        return 0
-
-    export_lora(config)
-    LOGGER.info("LoRA 导出完成")
-    return 0
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
+if __name__ == "__main__":
+    main()
