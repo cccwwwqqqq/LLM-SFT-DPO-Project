@@ -1,0 +1,390 @@
+#!/usr/bin/env python
+"""Direct Preference Optimization (DPO) training script with dry-run planning."""
+
+from __future__ import annotations
+from trl import DPOConfig
+import datetime
+import argparse
+import json
+import logging
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional, Sequence
+from peft import LoraConfig, get_peft_model, PeftModel
+import yaml
+
+from scripts.utils_data import LengthBucket, MixedBucketSampler, SamplingItem, estimate_chinese_ratio, estimate_token_length
+from scripts.utils_data import get_latest_adapter
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class DpoConfig:
+    general: Dict[str, Any]
+    model: Dict[str, Any]
+    lora: Dict[str, Any]
+    training: Dict[str, Any]
+    dpo: Dict[str, Any]
+    data: Dict[str, Any]
+    metrics: Dict[str, Any]
+
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "general": {
+        "dry_run": True,
+        "seed": 42,
+        "output_dir": "outputs/align",
+        "log_dir": "outputs/align/logs_dpo",
+        "log_backend": "none",
+        "checkpointing_steps": 500,
+        "eval_steps": 500,
+        "save_total_limit": 3,
+    },
+    "model": {
+        "base_model": "outputs/sft",
+        "trust_remote_code": True,
+        "gradient_checkpointing": True,
+        "max_seq_length": 2048,
+    },
+    "lora": {
+        "enable": True,
+        "r": 16,
+        "alpha": 16,
+        "dropout": 0.05,
+        "target_modules": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+        "bias": "none",
+    },
+    "training": {
+        "epochs": 1.0,
+        "per_device_train_batch_size": 2,
+        "gradient_accumulation_steps": 16,
+        "per_device_eval_batch_size": 2,
+        "learning_rate": 6.0e-5,
+        "lr_scheduler_type": "cosine",
+        "warmup_ratio": 0.05,
+        "weight_decay": 0.0,
+        "max_grad_norm": 1.0,
+        "bf16": True,
+        "tf32": True,
+    },
+    "dpo": {
+        "beta": 0.2,
+        "reference_free": False,
+        "length_penalty": 0.02,
+        "prefer_chinese_ratio": 0.7,
+    },
+    "data": {
+        "train_file": "data_proc/pref_train.jsonl",
+        "eval_file": "data_proc/pref_val.jsonl",
+        "streaming": False,
+        "mix": {"dpo_en_zh_20k": 1.0}
+    },
+    "metrics": {
+        "log_tokens_per_second": True,
+        "sample_eval_prompts": [
+            "当用户请求生成虚假医疗建议时，请拒绝并提供安全替代方案。",
+            "比较两个项目章程，指出更完善的一份，并说明理由。",
+        ],
+    },
+}
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="DPO alignment trainer")
+    parser.add_argument("--config", type=str, default="configs/dpo.yaml")
+    parser.add_argument("--dry-run", type=str, default=None)
+    parser.add_argument("--log-backend", type=str, choices=["none", "tensorboard", "wandb"], default=None)
+    parser.add_argument("--log-level", type=str, default="INFO")
+    return parser.parse_args(argv)
+
+
+def load_config(path: str) -> DpoConfig:
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    cfg_path = Path(path)
+    if cfg_path.exists():
+        with cfg_path.open("r", encoding="utf-8") as f:
+            update = yaml.safe_load(f) or {}
+        cfg = deep_update(cfg, update)
+    return DpoConfig(**cfg)
+
+
+def deep_update(base: Mapping[str, Any], update: Mapping[str, Any]) -> Dict[str, Any]:
+    result = dict(base)
+    for key, value in update.items():
+        if isinstance(value, Mapping) and isinstance(result.get(key), Mapping):
+            result[key] = deep_update(result[key], value)  # type: ignore[arg-type]
+        else:
+            result[key] = value
+    return result
+
+
+def apply_cli_overrides(config: DpoConfig, args: argparse.Namespace) -> DpoConfig:
+    general = dict(config.general)
+    if args.dry_run is not None:
+        general["dry_run"] = str(args.dry_run).lower() not in {"false", "0", "no"}
+    if args.log_backend is not None:
+        general["log_backend"] = args.log_backend
+    return DpoConfig(
+        general=general,
+        model=config.model,
+        lora=config.lora,
+        training=config.training,
+        dpo=config.dpo,
+        data=config.data,
+        metrics=config.metrics,
+    )
+
+
+def dry_run_report(config: DpoConfig) -> None:
+    LOGGER.info("Dry-run 模式：打印计划与检查项")
+    train_path = Path(config.data["train_file"])
+    eval_path = Path(config.data["eval_file"])
+    LOGGER.info("训练数据: %s (存在=%s)", train_path, train_path.exists())
+    LOGGER.info("验证数据: %s (存在=%s)", eval_path, eval_path.exists())
+    total_batch = config.training["per_device_train_batch_size"] * config.training["gradient_accumulation_steps"]
+    LOGGER.info("估算总步数: ~%s", math.ceil(120000 / max(1, total_batch)))
+    sampler = MixedBucketSampler(
+        length_buckets=[LengthBucket(name="generic", min_tokens=0, max_tokens=config.model.get("max_seq_length", 2048))],
+        target_cn_ratio=config.dpo.get("prefer_chinese_ratio", 0.7),
+        seed=config.general.get("seed", 42),
+    )
+    plan = sampler.plan(
+        total_samples=4,
+        available_items=[
+            SamplingItem("pref-cn", "DPO_EN_ZH_20K", 512, 0.9, {}),
+            SamplingItem("pref-en", "SHP", 320, 0.2, {}),
+        ],
+        source_weights=config.data.get("mix", {}),
+    )
+    LOGGER.info("采样器示例统? %s", plan.stats)
+
+
+def setup_logging(log_dir: str, backend: str) -> None:
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    if backend == "tensorboard":  # pragma: no cover
+        try:
+            from torch.utils.tensorboard import SummaryWriter  # type: ignore
+
+            SummaryWriter(log_dir)
+        except ImportError:
+            LOGGER.warning("tensorboard 未安装，忽略")
+    elif backend == "wandb":  # pragma: no cover
+        import wandb  # type: ignore
+
+        if not wandb.run:
+            wandb.init(project="dpo-alignment", dir=log_dir)
+
+
+# def build_dataset(path: str, sampler: MixedBucketSampler, weights: Mapping[str, float]) -> Dataset:
+#     # Heavy imports moved inside to avoid OOM during dry-run
+#     from datasets import Dataset, load_dataset  # type: ignore
+#     raw = load_dataset("json", data_files=path, split="train", download_mode="force_redownload")
+#     items = [
+#         SamplingItem(
+#             identifier=row.get("source", "PREF") + row.get("prompt", "")[:12],
+#             source=row.get("source", "PREF"),
+#             text_length=estimate_token_length("\n".join([row.get("prompt", ""), row.get("chosen", ""), row.get("rejected", "")])),
+#             chinese_ratio=estimate_chinese_ratio("\n".join([row.get("prompt", ""), row.get("chosen", ""), row.get("rejected", "")])),
+#             payload=row,
+#         )
+#         for row in raw
+#     ]
+#     plan = sampler.plan(total_samples=len(items), available_items=items, source_weights=weights)
+#     LOGGER.info("采样后样本数: %d", len(plan.selected))
+#     return Dataset.from_list([item.payload for item in plan.selected])
+def build_dataset(path: str, sampler: MixedBucketSampler, weights: Mapping[str, float]) -> Dataset:
+    # 保持这里的 heavy imports
+    from datasets import Dataset, load_dataset
+    
+    # 1. 强制重载 (确保这一步你已经加上了)
+    LOGGER.info(f"正在加载数据文件: {path}")
+    raw = load_dataset("json", data_files=path, split="train", download_mode="force_redownload")
+
+    items = []
+    # === [诊断代码开始] ===
+    print(f"\n[DIAGNOSTIC] 开始逐条检查数据 (前 5 条)...")
+    for i, row in enumerate(raw):
+        # 1. 获取原始内容
+        p = row.get("prompt", "")
+        c = row.get("chosen", "")
+        r = row.get("rejected", "")
+        
+        # 2. 拼接文本 (与 check_ratio.py 保持一致)
+        full_text = "\n".join([p, c, r])
+        
+        # 3. 实时计算比例
+        # 注意：这里直接调用 utils_data 里的函数
+        ratio = estimate_chinese_ratio(full_text)
+        length = estimate_token_length(full_text)
+        
+        # 4. 打印前 5 条的详细信息
+        if i < 5:
+            print(f"--- Row {i} ---")
+            print(f"Content Preview: {full_text[:50].replace(chr(10), ' ')}...")
+            print(f"Prompt Length: {len(p)}, Chosen Length: {len(c)}")
+            print(f"Calculated Ratio: {ratio:.4f}")
+            print(f"Judged as: {'CN' if ratio >= 0.6 else 'EN'}")
+        
+        # 5. 构建对象
+        item = SamplingItem(
+            identifier=row.get("source", "PREF") + str(i),
+            source=row.get("source", "PREF"),
+            text_length=length,
+            chinese_ratio=ratio,
+            payload=row,
+        )
+        items.append(item)
+    print(f"[DIAGNOSTIC] 检查结束，共处理 {len(items)} 条数据。\n")
+    # === [诊断代码结束] ===
+
+    # 原有的采样逻辑
+    plan = sampler.plan(total_samples=len(items), available_items=items, source_weights=weights)
+    LOGGER.info("采样后样本数: %d", len(plan.selected))
+    return Dataset.from_list([item.payload for item in plan.selected])
+
+def train(config: DpoConfig) -> None:
+    # Import heavy libs lazily to keep dry-run lightweight
+    import torch  # type: ignore
+    from datasets import Dataset  # type: ignore
+    from peft import LoraConfig, get_peft_model  # type: ignore
+    from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments  # type: ignore
+    from trl import DPOTrainer  # type: ignore
+
+    setup_logging(config.general["log_dir"], config.general.get("log_backend", "none"))
+    threshold = config.dpo.get("cn_threshold", 0.6)
+    LOGGER.info(f"当前中文判定阈值 (CN Threshold): {threshold}") # <--- 加上这行打印确认
+    sampler = MixedBucketSampler(
+        length_buckets=[LengthBucket(name="generic", min_tokens=0, max_tokens=config.model.get("max_seq_length", 2048))],
+        target_cn_ratio=config.dpo.get("prefer_chinese_ratio", 0.6),
+        cn_threshold=threshold,
+        seed=config.general.get("seed", 42),
+    )
+
+    datasets = {}
+    weights = config.data.get("mix", {})
+    for split_name, file_key in (("train", "train_file"), ("eval", "eval_file")):
+        path = config.data.get(file_key)
+        if path:
+            LOGGER.info("加载偏好数据%s", path)
+            datasets[split_name] = build_dataset(path, sampler, weights)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model["base_model"], trust_remote_code=config.model.get("trust_remote_code", False))
+    tokenizer.padding_side = "right"
+
+    LOGGER.info(f"加载基座模型: {config.model['base_model']}")
+    model = AutoModelForCausalLM.from_pretrained(
+        config.model["base_model"],
+        trust_remote_code=config.model.get("trust_remote_code", False),
+        torch_dtype=torch.bfloat16 if config.training.get("bf16") else None,
+    )
+    
+    sft_root = config.model.get("sft_adapter") # 从配置读取 SFT 根目录
+    
+    if sft_root:
+        # 1. 自动解析出最新的时间戳目录
+        latest_sft_path = get_latest_adapter(sft_root)
+        LOGGER.info(f"Auto-detected SFT Adapter: {latest_sft_path}")
+        
+        # 2. 加载 SFT Adapter
+        LOGGER.info("Merging SFT adapter into base model (In-Memory)...")
+        model = PeftModel.from_pretrained(model, latest_sft_path)
+        
+        # 3. 合并并卸载 (Merge & Unload)
+        # 这一步会将 LoRA 权重加到基座模型参数里，并释放 Adapter 结构
+        model = model.merge_and_unload()
+        LOGGER.info("Merge complete. Model is now ready for DPO.")
+    
+        
+    if config.lora.get("enable"):
+        lora_cfg = LoraConfig(
+            r=config.lora.get("r", 16),
+            lora_alpha=config.lora.get("alpha", 16),
+            lora_dropout=config.lora.get("dropout", 0.05),
+            bias=config.lora.get("bias", "none"),
+            target_modules=config.lora.get("target_modules"),
+        )
+        model = get_peft_model(model, lora_cfg)
+
+    training_args = DPOConfig(
+        output_dir=config.general["output_dir"],
+        num_train_epochs=config.training["epochs"],
+        per_device_train_batch_size=config.training["per_device_train_batch_size"],
+        per_device_eval_batch_size=config.training["per_device_eval_batch_size"],
+        gradient_accumulation_steps=config.training["gradient_accumulation_steps"],
+        learning_rate=config.training["learning_rate"],
+        lr_scheduler_type=config.training["lr_scheduler_type"],
+        warmup_ratio=config.training["warmup_ratio"],
+        weight_decay=config.training["weight_decay"],
+        max_grad_norm=config.training["max_grad_norm"],
+        logging_dir=config.general["log_dir"],
+        logging_steps=50,
+        eval_strategy="steps",
+        eval_steps=config.general["eval_steps"],
+        save_steps=config.general["checkpointing_steps"],
+        save_total_limit=config.general["save_total_limit"],
+        bf16=config.training.get("bf16", False),
+        tf32=config.training.get("tf32", False),
+        gradient_checkpointing=config.model.get("gradient_checkpointing", False),
+    )
+
+
+    trainer = DPOTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=datasets.get("train"),
+        eval_dataset=datasets.get("eval"),
+        processing_class=tokenizer,
+    )
+
+    trainer.train()
+    trainer.save_model(config.general["output_dir"])
+    tokenizer.save_pretrained(config.general["output_dir"])
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+    config = apply_cli_overrides(load_config(args.config), args)
+
+    # === [开始修改] 动态生成时间戳路径 (与 SFT 保持一致) ===
+    if not config.general.get("dry_run", True):
+        # 获取当前时间
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 获取原始配置的基础路径 (默认为 outputs/align)
+        base_output_dir = config.general["output_dir"]
+        
+        # 构造新路径: outputs/align/times/20260206_213000
+        new_output_dir = f"{base_output_dir}/times/{timestamp}"
+        
+        # 更新配置
+        config.general["output_dir"] = new_output_dir
+        # 更新日志路径，放在该时间戳目录下的 logs 文件夹中
+        config.general["log_dir"] = f"{new_output_dir}/logs"
+        
+        LOGGER.info(f"已将 DPO 输出路径重定向至: {new_output_dir}")
+    # === [结束修改] ===
+
+    Path(config.general["output_dir"]).mkdir(parents=True, exist_ok=True)
+    if config.general.get("dry_run", True):
+        dry_run_report(config)
+        return 0
+
+    train(config)
+    LOGGER.info("DPO 训练完成")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
+

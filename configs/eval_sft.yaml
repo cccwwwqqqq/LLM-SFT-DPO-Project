@@ -1,0 +1,26 @@
+general:
+  dry_run: true
+  seed: 42
+  output_json: outputs/eval_sft/results.json
+  output_csv: outputs/eval_sft/results.csv
+  log_dir: outputs/eval_sft/logs
+
+model:
+  base_model: "/root/autodl-tmp/hf_cache/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28"
+  peft_adapter: outputs/sft
+  trust_remote_code: true
+
+tasks:
+#  - cmmlu
+  - ceval-valid 
+#  - hellaswag
+  - winogrande
+
+metrics:
+  save_raw: true
+  summarize: true
+
+lm_eval:
+  limit: null
+  batch_size: 4
+  use_cache: true

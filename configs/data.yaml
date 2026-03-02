@@ -1,0 +1,56 @@
+# 数据准备配置（默认：4090/5090 单卡通用）
+general:
+  dry_run: true              # 本地默认仅打印计划；远程执行设为 false
+  seed: 42
+  min_cn_ratio: 0.3
+  allow_english_fallback: true
+  data_root: data_raw
+  proc_root: data_proc
+  stage: all                 # 可选：all|sft|pref
+  # 统一限制样本长度，注意回复长度一般在 4096 tokens 以下
+  min_tokens: 4
+  max_tokens: 4096
+  max_repetition: 0.6
+
+sft:
+  # 训练数据量建议：单卡 4090/5090 初学项目可从 60k 起步
+  max_samples: 40000
+  mix:
+    mxode_stem: 1.0
+    mxode_commonsense: 0.3
+    mxode_general: 0.2
+  curriculum:
+    enabled: false           # 课程式混合（默认关闭）
+    phases:
+      - start: 0.0
+        end: 0.4
+        weights:
+          short: 0.6
+          long: 0.4
+      - start: 0.4
+        end: 1.0
+        weights:
+          short: 0.3
+          long: 0.7
+
+preference:
+  # DPO-En-Zh-20k 全量约 20k，按实际过滤后略小
+  max_samples: 20000
+  mix:
+    dpo_en_zh_20k: 1.0
+
+length_buckets:
+  - name: short
+    min_tokens: 0
+    max_tokens: 256
+  - name: medium
+    min_tokens: 257
+    max_tokens: 1024
+  - name: long
+    min_tokens: 1025
+    max_tokens: 4096
+
+logging:
+  output_dir: outputs/logs
+  verbosity: info
+
